@@ -1,0 +1,1 @@
+ALTER TABLE "runs" ADD COLUMN "statements" jsonb DEFAULT '[]'::jsonb NOT NULL;
