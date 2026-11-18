@@ -31,6 +31,10 @@ export type Run = {
   id: string
   status: 'running' | 'succeeded' | 'failed'
   error: string | null
+  /** The statement the run sent to the warehouse last: the one its rows come from. */
+  sql: string
+  /** Every statement the run sent, in order; `sql` is the last. */
+  statements: string[]
   columns: ResultColumn[] | null
   rows: Row[] | null
   /** Rows the query produced; more than `rows.length` if the result was capped. */

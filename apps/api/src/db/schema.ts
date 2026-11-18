@@ -177,8 +177,10 @@ export const runs = pgTable(
     kind: text({ enum: ['chart', 'drill'] })
       .notNull()
       .default('chart'),
-    /** Compiled SQL as executed, since the chart may be edited afterwards. */
+    /** The statement submitted last, as executed, since the chart may be edited afterwards. */
     sql: text().notNull(),
+    /** Every statement the run has submitted, in order; the last is `sql`. Empty for runs older than this column. */
+    statements: jsonb<string[]>().notNull().default([]),
     /**
      * Snowflake query ID of the frozen base rows. A chart run of a drillable
      * chart freezes them first and aggregates the frozen copy; drill runs

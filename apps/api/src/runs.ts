@@ -72,6 +72,14 @@ export type RunView = {
   kind: 'chart' | 'drill'
   status: 'running' | 'succeeded' | 'failed'
   error: string | null
+  /** The statement the run submitted last, as the warehouse received it: the one its rows come from once it has succeeded. */
+  sql: string
+  /**
+   * Every statement the run submitted, in order; `sql` is the last. A later one
+   * reads the stored result of an earlier one (`result_scan`), so the tables
+   * and filters are in the first.
+   */
+  statements: string[]
   /** Null until the run has succeeded. */
   columns: ResultColumn[] | null
   rows: Record<string, unknown>[] | null
@@ -231,7 +239,7 @@ async function start(
   }
   const [run] = await deps.db
     .insert(s.runs)
-    .values({ ...values, ...outcome, chartId: query.id })
+    .values({ ...values, ...outcome, statements: [sql], chartId: query.id })
     .returning()
   return view(run!, query)
 }
@@ -263,7 +271,7 @@ async function advance(deps: RunDeps, run: Run, query: Query, warehouse: Warehou
   }
   const submitOrFail = async (sql: string, params: unknown[], values: Partial<typeof s.runs.$inferInsert>, forResultScan = false) => {
     try {
-      return await update({ ...values, sql, statementHandle: await warehouse.submit(sql, params, { forResultScan }) })
+      return await update({ ...values, sql, statements: [...statements(run), sql], statementHandle: await warehouse.submit(sql, params, { forResultScan }) })
     } catch (error) {
       if (!(error instanceof SnowflakeError)) throw error
       return update({ ...finished(), status: 'failed', error: error.message })
@@ -312,6 +320,9 @@ async function advance(deps: RunDeps, run: Run, query: Query, warehouse: Warehou
   })
 }
 
+/** Runs recorded before `statements` existed kept only their last statement. */
+const statements = (run: Run) => (run.statements.length > 0 ? run.statements : [run.sql])
+
 function view(run: Run, query: Query): RunView {
   const base: RunView = {
     id: run.id,
@@ -319,6 +330,8 @@ function view(run: Run, query: Query): RunView {
     kind: run.kind,
     status: run.status,
     error: run.error,
+    sql: run.sql,
+    statements: statements(run),
     columns: run.columns,
     rows: run.rows,
     rowCount: run.rowCount,

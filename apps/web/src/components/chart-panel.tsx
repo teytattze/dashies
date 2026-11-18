@@ -1,6 +1,7 @@
 import { ChevronLeft, ChevronRight, LoaderCircle, RefreshCw, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ChartView, DataTable, PointLabel } from '@/components/chart-view'
+import { RunSql } from '@/components/run-sql'
 import { Button } from '@/components/ui/button'
 import {
   type Chart,
@@ -121,6 +122,7 @@ export function ChartPanel({ chartId, version, building }: { chartId: string | n
             ))}
           </div>
         )}
+        {chart?.spec && run && <RunSql run={run} />}
         {chart?.spec && (
           <Button variant="outline" size="icon-sm" onClick={() => setRefresh((n) => n + 1)} disabled={loading} aria-label="Run again">
             <RefreshCw />
@@ -227,6 +229,7 @@ function DrillList(props: { chartId: string; token: string; point: Row; title: R
             {drill.totalItems !== null && ` of ${drill.totalItems}${drill.truncated ? '+' : ''}`}
           </span>
         )}
+        {page && <RunSql run={page} variant="ghost" />}
         <Button variant="ghost" size="icon-sm" disabled={loading || !drill || drill.page === 0} onClick={() => drill && go(drill.page - 1)} aria-label="Previous page">
           <ChevronLeft />
         </Button>

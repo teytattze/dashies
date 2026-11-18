@@ -118,6 +118,26 @@ async function runChart(id = chartId, filters?: FilterSelection) {
   return (await settle(started.run.id)).run
 }
 
+test('a run returns every statement it submitted, the last as its sql', async () => {
+  const started = await call('POST', `/api/charts/${chartId}/runs`)
+  expect(started.run.statements).toEqual([started.run.sql])
+  expect(started.run.sql).toContain('select * from orders')
+
+  const { run } = await settle(started.run.id)
+  expect(run.statements).toHaveLength(2)
+  expect(run.statements[0]).toBe(started.run.sql)
+  expect(run.sql).toBe(run.statements[1]!)
+  expect(run.sql).toContain('group by')
+
+  const raw = await runChart(await addChart({ sql: 'select 1' }))
+  expect(raw).toMatchObject({ sql: 'select 1', statements: ['select 1'] })
+
+  const drill = await call('POST', `/api/charts/${chartId}/drill-runs`, { token: run.id, row: { region: 'US' } })
+  const page = (await settle(drill.run.id)).run
+  expect(page.statements).toHaveLength(2)
+  expect(page.sql).toBe(page.statements[1]!)
+})
+
 test('a chart run is started, polled while running, then returns the aggregated rows', async () => {
   const started = await call('POST', `/api/charts/${chartId}/runs`)
   expect(started.status).toBe(202)
