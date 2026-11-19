@@ -1,7 +1,18 @@
 import { beforeAll, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
-import type { AggregateExpr, Predicate, ScalarExpr } from '../db/types.ts'
-import { compileBase, compileChart, compileDrillPage, compileDrillSnapshot, type QueryDefinition, resolveFilters } from './compile.ts'
+import type { AggregateExpr, LookupFilter, Predicate, ScalarExpr } from '../db/types.ts'
+import {
+  compileBase,
+  compileChart,
+  compileDrillPage,
+  compileDrillSnapshot,
+  compileLookup,
+  LOOKUP_MAX_OPTIONS,
+  lookupOptions,
+  lookupsNeeded,
+  type QueryDefinition,
+  resolveFilters,
+} from './compile.ts'
 import { postgres, snowflake } from './dialect.ts'
 import { aggregateSql, scalarSql } from './expr.ts'
 
@@ -192,6 +203,40 @@ test('a run applies the options asked for, or each filter\'s default', () => {
   expect(() => resolveFilters(filters, { Size: ['large', 'small'] })).toThrow('Filter "Size" takes one option')
   // Names that exist on every object are not filters.
   expect(() => resolveFilters(filters, { toString: [] })).toThrow('no filter "toString"')
+})
+
+test('a lookup filter keeps the rows whose value is one of the picked options', () => {
+  const lookup: LookupFilter = { kind: 'lookup', name: 'Region', multi: true, expr: { type: 'column', name: 'region' }, default: ['US', 'GONE'] }
+  // The options are read from the base rows as they are, whatever the other filters pick.
+  expect(compileLookup({ ...filtered, sql: 'select * from orders;' }, lookup, postgres)).toBe(
+    'select distinct "region" as "key" from (select * from orders) as base where "region" is not null order by 1 limit 101',
+  )
+  expect(compileLookup(filtered, { ...lookup, expr: { type: 'date_trunc', unit: 'month', arg: { type: 'column', name: 'a"b' } } }, snowflake)).toContain(
+    `select distinct date_trunc('month', "a""b") as "key"`,
+  )
+
+  // One option per value, labelled with it; a key keeps its value's type.
+  const options = lookupOptions([{ key: 'US' }, { key: 7 }, { key: 'US' }, { key: null }])
+  expect(options).toEqual([{ key: 'US', label: 'US', value: 'US' }, { key: '7', label: '7', value: 7 }])
+  expect(lookupOptions(Array.from({ length: 150 }, (_, key) => ({ key })))).toHaveLength(LOOKUP_MAX_OPTIONS)
+
+  const lookups = { Region: options }
+  // The default applies, less the option that no longer exists.
+  expect(resolveFilters([lookup], {}, lookups)).toEqual({ selection: { Region: ['US'] }, where: [{ type: 'in', arg: lookup.expr, values: ['US'] }] })
+  expect(resolveFilters([lookup], { Region: ['7', 'US'] }, lookups)).toEqual({
+    selection: { Region: ['US', '7'] },
+    where: [{ type: 'in', arg: lookup.expr, values: ['US', 7] }],
+  })
+  expect(resolveFilters([lookup], { Region: [] }, lookups)).toEqual({ selection: { Region: [] }, where: [] })
+  expect(() => resolveFilters([lookup], { Region: ['GONE'] }, lookups)).toThrow('Filter "Region" has no option "GONE"')
+  expect(() => resolveFilters([{ ...lookup, multi: false }], { Region: ['7', 'US'] }, lookups)).toThrow('takes one option')
+  // Options that were not read are not options.
+  expect(() => resolveFilters([lookup], { Region: ['US'] })).toThrow('has no option "US"')
+
+  // Only the filters a run picks from need their options read.
+  expect(lookupsNeeded([lookup, ...filtered.filters])).toEqual([lookup])
+  expect(lookupsNeeded([lookup], { Region: [] })).toEqual([])
+  expect(lookupsNeeded([{ ...lookup, default: undefined }], { Region: ['US'] })).toHaveLength(1)
 })
 
 test('a filtered chart and its drill-downs keep exactly the same rows', async () => {

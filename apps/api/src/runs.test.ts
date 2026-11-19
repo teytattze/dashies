@@ -4,10 +4,11 @@ import { eq } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
 import { migrate } from 'drizzle-orm/pglite/migrator'
 import * as s from './db/schema.ts'
-import type { FilterSelection, Predicate, ScalarExpr } from './db/types.ts'
+import type { FilterSelection, LookupFilter, Predicate, ScalarExpr } from './db/types.ts'
 import { createApp } from './http.ts'
 import { postgres } from './query/dialect.ts'
 import type { GenerateDeps } from './ai/generate.ts'
+import { forgetLookups } from './lookups.ts'
 import type { RunView, Warehouse } from './runs.ts'
 import { SnowflakeError } from './snowflake/client.ts'
 
@@ -20,9 +21,19 @@ const db = drizzle(pg, { schema: s, casing: 'snake_case' })
  * statement as running at first, and keeps each result under the statement's
  * ID (here: as a table of that name) for later statements to read.
  */
-const warehouse: Warehouse & { submitted: string[]; forResultScan: boolean[] } = {
+const warehouse: Warehouse & { submitted: string[]; forResultScan: boolean[]; executed: string[] } = {
   submitted: [],
   forResultScan: [],
+  executed: [],
+  async execute(sql) {
+    this.executed.push(sql)
+    try {
+      const { rows, fields } = await pg.query<Record<string, unknown>>(sql)
+      return { queryId: crypto.randomUUID(), columns: fields.map((f) => ({ name: f.name, type: 'other' as const, nativeType: 'other' })), rows, totalRows: rows.length }
+    } catch (error) {
+      throw new SnowflakeError(String(error), 422)
+    }
+  },
   async submit(sql, params = [], options = {}) {
     const id = crypto.randomUUID()
     const literal = (v: unknown) => (typeof v === 'number' ? String(v) : `'${String(v)}'`)
@@ -351,6 +362,75 @@ test('filter selections that do not fit the chart are refused before anything is
   expect((await run('{not json')).status).toBe(400)
   expect(await call('POST', `/api/charts/${chartId}/runs`, { filters: { Size: [] } })).toMatchObject({ status: 400, error: 'The chart has no filter "Size"' })
   expect(warehouse.submitted.length).toBe(sent)
+})
+
+test('a lookup filter offers the values its expression has in the base rows, and a run keeps the rows whose value was picked', async () => {
+  const options = async (chart: string) => {
+    const response = await app.request(`/api/charts/${chart}/filter-options`)
+    return { status: response.status, ...((await response.json()) as { options?: unknown; error?: string }) }
+  }
+  const lookupChart = (sql: string, filter: Partial<LookupFilter> = {}) =>
+    addChart({
+      sql,
+      dimensions: [{ name: 'region', expr: col('region') }],
+      measures: [{ name: 'orders', expr: { type: 'aggregate', fn: 'count' } }],
+      orderBy: [{ field: 'region', direction: 'asc' }],
+      drill: { rowKey: ['id'], columns: ['id', 'total'], orderBy: [], pageSize: 3 },
+      filters: [
+        { kind: 'lookup', name: 'Region', multi: true, expr: col('region'), ...filter },
+        { name: 'Size', options: [{ key: 'large', label: 'Large', where: totalIs('>=', 50) }] },
+      ],
+    })
+  const id = await lookupChart('select * from orders')
+
+  // Only lookup filters are listed: the distinct values, in order.
+  expect(await options(id)).toEqual({ status: 200, options: { Region: [{ key: 'EU', label: 'EU' }, { key: 'US', label: 'US' }] } })
+  expect(await options(chartId)).toEqual({ status: 200, options: {} })
+  expect(warehouse.executed.at(-1)).toBe(`select distinct "region" as "key" from (select * from orders) as base where "region" is not null order by 1 limit 101`)
+
+  // Nothing picked keeps every row, without reading the options.
+  forgetLookups()
+  const read = warehouse.executed.length
+  expect((await runChart(id)).filters).toEqual({ Region: [], Size: [] })
+  expect(warehouse.executed.length).toBe(read)
+
+  const before = warehouse.submitted.length
+  const us = await runChart(id, { Region: ['US'] })
+  expect(us.filters).toEqual({ Region: ['US'], Size: [] })
+  expect(us.rows).toEqual([{ region: 'US', orders: 1 }])
+  expect(warehouse.submitted[before]).toBe(`select * from (select * from orders) as unfiltered where ("region" in ('US'))`)
+  expect(warehouse.executed.length).toBe(read + 1)
+
+  // A value new to the data becomes an option once the remembered list is dropped; until then it is not one.
+  await pg.exec(`insert into orders values (10, 'APAC', 70)`)
+  try {
+    expect(await call('POST', `/api/charts/${id}/runs`, { filters: { Region: ['APAC'] } })).toMatchObject({ status: 400, error: 'Filter "Region" has no option "APAC"' })
+    forgetLookups()
+    expect(((await options(id)).options as { Region: unknown[] }).Region).toHaveLength(3)
+    // Another filter's pick does not narrow the options, only the rows.
+    const both = await runChart(id, { Region: ['EU', 'APAC'], Size: ['large'] })
+    expect(both.filters).toEqual({ Region: ['APAC', 'EU'], Size: ['large'] })
+    expect(both.rows).toEqual([{ region: 'APAC', orders: 1 }, { region: 'EU', orders: 4 }])
+
+    // The drill-down lists the rows the run was filtered to.
+    const started = await call('POST', `/api/charts/${id}/drill-runs`, { token: both.drillToken, row: both.rows![0] })
+    expect((await settle(started.run.id)).run.rows).toEqual([{ id: 10, total: 70 }])
+  } finally {
+    await pg.exec(`delete from orders where id = 10`)
+    forgetLookups()
+  }
+
+  // A key is only ever matched against the list, never spliced in.
+  const sent = warehouse.submitted.length
+  expect((await call('POST', `/api/charts/${id}/runs`, { filters: { Region: ["US') or 1=1 --"] } })).status).toBe(400)
+  expect(warehouse.submitted.length).toBe(sent)
+
+  // A default that names a value the data no longer holds is skipped.
+  expect((await runChart(await lookupChart('select * from orders', { default: ['LATAM'] }))).filters).toEqual({ Region: [], Size: [] })
+  // Options that cannot be read are reported; the chart still runs with nothing picked.
+  const broken = await lookupChart('select * from no_such_table')
+  expect(await options(broken)).toMatchObject({ status: 409, error: expect.stringContaining('Filter "Region" could not read its options') })
+  expect((await call('POST', `/api/charts/${broken}/runs`, { filters: { Region: ['US'] } })).status).toBe(409)
 })
 
 test('a statement the warehouse rejects ends the run as failed with its message', async () => {

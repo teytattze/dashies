@@ -25,6 +25,18 @@
         "dev"
       ],
       "port": 3000
+    },
+    {
+      "name": "studio",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": [
+        "run",
+        "--cwd",
+        "apps/api",
+        "db:studio"
+      ],
+      "port": 4983,
+      "url": "https://local.drizzle.studio"
     }
   ]
 }

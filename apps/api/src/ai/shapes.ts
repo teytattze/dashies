@@ -1,4 +1,5 @@
 import * as z from 'zod'
+import { LOOKUP_MAX_OPTIONS } from '../query/compile.ts'
 import type { AggregateExpr, ChartFilter, ChartSpec, Dimension, DrillSpec, Measure, OrderBy, Predicate, ScalarExpr } from '../db/types.ts'
 
 /**
@@ -72,21 +73,40 @@ export const drillSpec: z.ZodType<DrillSpec> = z.object({
   pageSize: z.int().min(1).max(200),
 })
 
-export const chartFilter: z.ZodType<ChartFilter> = z.object({
+const filterShared = {
   name: name.describe('Shown beside the control, e.g. "Status"'),
-  options: z
-    .array(
-      z.object({
-        key: z.string().min(1).max(50).describe('Short stable identifier, unique within the filter'),
-        label: z.string().min(1).max(100).describe('What the viewer reads'),
-        where: predicate.describe('The base rows this option keeps'),
-      }),
-    )
-    .min(1)
-    .max(20),
   multi: z.boolean().optional().describe('Several options may be picked at once; rows matching any of them are kept'),
   default: z.array(z.string()).optional().describe('Option keys picked when the chart opens. Omit to start with every row'),
-})
+}
+
+const fixedFilter = z
+  .object({
+    kind: z.literal('options').optional(),
+    ...filterShared,
+    options: z
+      .array(
+        z.object({
+          key: z.string().min(1).max(50).describe('Short stable identifier, unique within the filter'),
+          label: z.string().min(1).max(100).describe('What the viewer reads'),
+          where: predicate.describe('The base rows this option keeps'),
+        }),
+      )
+      .min(1)
+      .max(20),
+  })
+  .describe('A filter with options you write out')
+
+const lookupFilter = z
+  .object({
+    kind: z.literal('lookup'),
+    ...filterShared,
+    expr: scalarExpr.describe(
+      `The base-row value to filter on, usually one column, e.g. STATUS. Its distinct values in the base SQL are the options (at most ${LOOKUP_MAX_OPTIONS}); default names them as text`,
+    ),
+  })
+  .describe('A filter whose options are the distinct values of one expression over the base SQL, read each time the chart is shown')
+
+export const chartFilter: z.ZodType<ChartFilter> = z.union([lookupFilter, fixedFilter])
 
 const valueFormat = z.object({
   style: z.enum(['number', 'currency', 'percent', 'compact']).optional(),

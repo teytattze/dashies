@@ -94,7 +94,11 @@ export type FilterOption = {
  * drill-downs are filtered alike. Picked options of one filter are OR-ed,
  * filters are AND-ed; a filter with nothing picked keeps every row.
  */
-export type ChartFilter = {
+export type ChartFilter = FixedFilter | LookupFilter
+
+/** A filter whose options are written into the chart. */
+export type FixedFilter = {
+  kind?: 'options'
   /** Shown beside the control; unique within the chart. */
   name: string
   options: FilterOption[]
@@ -103,6 +107,25 @@ export type ChartFilter = {
   /** Option keys picked when a run does not say. Omitted = none. */
   default?: string[]
 }
+
+/**
+ * A filter whose options are the distinct values `expr` has in the chart's
+ * base rows, read from the warehouse when the chart is shown, so a new value
+ * becomes an option without the chart being saved again. Picking options keeps
+ * the base rows where `expr` equals one of them.
+ */
+export type LookupFilter = {
+  kind: 'lookup'
+  name: string
+  /** The base-row value offered and matched, usually one column. Its text is the option's key and label. */
+  expr: ScalarExpr
+  multi?: boolean
+  /** Keys picked when a run does not say; one the base rows no longer hold is skipped. */
+  default?: string[]
+}
+
+/** An option of a lookup filter, as last read from the warehouse. */
+export type LookupOption = { key: string; label: string; value: string | number | boolean }
 
 /** The option keys picked for each filter of a chart, by filter name. */
 export type FilterSelection = Record<string, string[]>

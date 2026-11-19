@@ -1,4 +1,4 @@
-import type { ChartFilter, Dimension, DrillSpec, FilterSelection, Measure, OrderBy, Predicate } from '../db/types.ts'
+import type { ChartFilter, Dimension, DrillSpec, FilterOption, FilterSelection, LookupFilter, LookupOption, Measure, OrderBy, Predicate } from '../db/types.ts'
 import type { Dialect } from './dialect.ts'
 import { aggregateSql, ident, predicateSql, scalarSql } from './expr.ts'
 
@@ -38,28 +38,81 @@ export function compileBase(q: QueryDefinition, d: Dialect, where: Predicate[] =
   return `select * from (${sql}) as unfiltered where ${where.map((p) => predicateSql(p, d)).join(' and ')}`
 }
 
+/** Most options a lookup filter offers. */
+export const LOOKUP_MAX_OPTIONS = 100
+
+export const isLookup = (filter: ChartFilter): filter is LookupFilter => filter.kind === 'lookup'
+
+/**
+ * SQL that reads a lookup filter's options: the distinct values of its
+ * expression over the query's base rows (unfiltered, so one filter's picks do
+ * not hide another's options), as `key`, in order. It asks for one row more
+ * than `LOOKUP_MAX_OPTIONS`, so the caller can tell when there are too many.
+ */
+export function compileLookup(q: QueryDefinition, filter: LookupFilter, d: Dialect): string {
+  const value = scalarSql(filter.expr, d)
+  return `select distinct ${value} as "key" from (${compileBase(q, d)}) as base where ${value} is not null order by 1 limit ${LOOKUP_MAX_OPTIONS + 1}`
+}
+
+/** The options in a lookup's result (see `compileLookup`): one per key, labelled with it, at most `LOOKUP_MAX_OPTIONS`. */
+export function lookupOptions(rows: Record<string, unknown>[]): LookupOption[] {
+  const options = new Map<string, LookupOption>()
+  for (const { key: value } of rows) {
+    if (value == null) continue
+    const key = String(value)
+    if (options.has(key)) continue
+    const comparable = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+    options.set(key, { key, label: key, value: comparable ? value : key })
+  }
+  return [...options.values()].slice(0, LOOKUP_MAX_OPTIONS)
+}
+
+/** The keys a run applies to one filter: those asked for, or its default where the request does not name it. */
+const asked = (filter: ChartFilter, requested: FilterSelection) =>
+  Object.hasOwn(requested, filter.name) ? requested[filter.name]! : (filter.default ?? [])
+
+/** The lookup filters whose options a run needs: those it picks from. A filter with nothing picked keeps every row whatever its options. */
+export const lookupsNeeded = (filters: ChartFilter[], requested: FilterSelection = {}): LookupFilter[] =>
+  filters.filter(isLookup).filter((filter) => asked(filter, requested).length > 0)
+
+/** Throws if `requested` names a filter the chart does not have. */
+export function knownFilters(filters: ChartFilter[], requested: FilterSelection = {}): void {
+  const unknown = Object.keys(requested).find((name) => !filters.some((f) => f.name === name))
+  if (unknown !== undefined) throw new Error(`The chart has no filter "${unknown}"`)
+}
+
 /**
  * The options a run applies: those asked for, or each filter's default where
  * the request does not name it. Returns them by filter name, and the
  * predicates that keep the matching base rows (to pass to `compileBase`).
- * Only option keys come from the client; the predicates are the stored ones.
+ * Only option keys come from the client; the predicates are the stored ones,
+ * or built from the values in `lookups`: the options of each lookup filter,
+ * by filter name, as read from the warehouse.
  */
-export function resolveFilters(filters: ChartFilter[], requested: FilterSelection = {}): { selection: FilterSelection; where: Predicate[] } {
-  const unknown = Object.keys(requested).find((name) => !filters.some((f) => f.name === name))
-  if (unknown !== undefined) throw new Error(`The chart has no filter "${unknown}"`)
+export function resolveFilters(
+  filters: ChartFilter[],
+  requested: FilterSelection = {},
+  lookups: Record<string, LookupOption[]> = {},
+): { selection: FilterSelection; where: Predicate[] } {
+  knownFilters(filters, requested)
 
   const selection: FilterSelection = {}
   const where: Predicate[] = []
   for (const filter of filters) {
-    const asked = Object.hasOwn(requested, filter.name) ? requested[filter.name]! : (filter.default ?? [])
-    const missing = asked.find((key) => !filter.options.some((o) => o.key === key))
+    const options: { key: string }[] = isLookup(filter) ? (Object.hasOwn(lookups, filter.name) ? lookups[filter.name]! : []) : filter.options
+    let keys = asked(filter, requested)
+    // A lookup's default may name a row that has since been removed; a request may not.
+    if (isLookup(filter) && !Object.hasOwn(requested, filter.name)) keys = keys.filter((key) => options.some((o) => o.key === key))
+    const missing = keys.find((key) => !options.some((o) => o.key === key))
     if (missing !== undefined) throw new Error(`Filter "${filter.name}" has no option "${missing}"`)
     // In the filter's own order, each once.
-    const picked = filter.options.filter((o) => asked.includes(o.key))
+    const picked = options.filter((o) => keys.includes(o.key))
     if (picked.length > 1 && !filter.multi) throw new Error(`Filter "${filter.name}" takes one option`)
     selection[filter.name] = picked.map((o) => o.key)
-    if (picked.length === 1) where.push(picked[0]!.where)
-    else if (picked.length > 1) where.push({ type: 'or', args: picked.map((o) => o.where) })
+    if (picked.length === 0) continue
+    if (isLookup(filter)) where.push({ type: 'in', arg: filter.expr, values: (picked as LookupOption[]).map((o) => o.value) })
+    else if (picked.length === 1) where.push((picked[0] as FilterOption).where)
+    else where.push({ type: 'or', args: (picked as FilterOption[]).map((o) => o.where) })
   }
   return { selection, where }
 }

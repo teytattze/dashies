@@ -9,7 +9,7 @@ import { drizzle } from 'drizzle-orm/pglite'
 import { migrate } from 'drizzle-orm/pglite/migrator'
 import type { chartView } from '../charts.ts'
 import * as s from '../db/schema.ts'
-import type { ChartFilter, Predicate, ScalarExpr } from '../db/types.ts'
+import type { ChartFilter, FixedFilter, LookupFilter, Predicate, ScalarExpr } from '../db/types.ts'
 import type { QueryDefinition } from '../query/compile.ts'
 import { createApp } from '../http.ts'
 import { postgres } from '../query/dialect.ts'
@@ -260,7 +260,7 @@ test('query definitions are checked before they are stored', async () => {
 
 test('filters are saved with the chart, and checked against the base columns first', async () => {
   const regionIs = (value: string | number): Predicate => ({ type: 'compare', op: '=', left: col('region'), right: { type: 'literal', value } })
-  const region: ChartFilter = {
+  const region: FixedFilter = {
     name: 'Region',
     options: [
       { key: 'eu', label: 'Europe', where: regionIs('EU') },
@@ -278,7 +278,7 @@ test('filters are saved with the chart, and checked against the base columns fir
 
   const check = (filters: ChartFilter[], changes: Partial<typeof byRegion> = {}) =>
     checkQuery(explorer, postgres, { ...byRegion, ...changes, filters })
-  const [eu, us] = region.options as [ChartFilter['options'][number], ChartFilter['options'][number]]
+  const [eu, us] = region.options as [FixedFilter['options'][number], FixedFilter['options'][number]]
   await expect(check([region])).resolves.toMatchObject({ resultColumns: [{ name: 'Region' }, { name: 'Revenue' }] })
   await expect(check([region, { ...region, default: [] }])).rejects.toThrow('Two filters are named "Region"')
   await expect(check([{ ...region, options: [eu, { ...us, key: 'eu' }] }])).rejects.toThrow('two options with the key "eu"')
@@ -292,6 +292,30 @@ test('filters are saved with the chart, and checked against the base columns fir
   // Caught by describing the filtered base: Postgres cannot compare text with a number.
   await expect(check([{ ...region, options: [eu, { ...us, where: regionIs(5) }] }])).rejects.toThrow()
   await expect(check([region], { dimensions: [], measures: [], orderBy: [], drill: undefined })).rejects.toThrow('cannot be filtered')
+})
+
+test('a lookup filter is checked against the base rows before it is saved', async () => {
+  const region: LookupFilter = { kind: 'lookup', name: 'Region', multi: true, expr: col('region'), default: ['US'] }
+  const { send, getChart } = await setup([
+    [{ call: 'save_chart', input: { ...barChart, query: { ...barChart.query, filters: [region] } } }],
+    'Added a region filter that follows the data.',
+  ])
+  const { messages } = await send('Filter by region, whatever regions there are')
+  expect(toolOutputs(messages[1]!)[0].error).toBeUndefined()
+  expect((await getChart()).query!.filters).toEqual([region])
+
+  const check = (changes: Partial<LookupFilter>, sql = byRegion.sql) =>
+    checkQuery(explorer, postgres, { ...byRegion, sql, filters: [{ ...region, ...changes }] })
+  await expect(check({})).resolves.toBeDefined()
+  await expect(check({ expr: col('REGION') })).rejects.toThrow('Unknown column in filter "Region": "REGION". The base SQL returns: "id", "region", "total"')
+  await expect(check({ default: ['APAC'] })).rejects.toThrow('names options it does not have: "APAC"')
+  await expect(check({ multi: false, default: ['US', 'EU'] })).rejects.toThrow('takes one option')
+  // Too many distinct values to offer as options.
+  await expect(check({ default: [] }, 'select n as id, n::text as region, n as total from generate_series(1, 101) n')).rejects.toThrow(
+    'would offer more than 100 options',
+  )
+  // No rows yet: nothing to pick so far, but the filter is fine.
+  await expect(check({ default: [] }, 'select * from orders where false')).resolves.toBeDefined()
 })
 
 test('the tools only change their own chart', async () => {

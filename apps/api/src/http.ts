@@ -5,7 +5,7 @@ import type { ValidationTargets } from 'hono'
 import * as z from 'zod'
 import { createChartFromPrompt, createThread, type GenerateDeps, getThreadMessages, streamReply } from './ai/generate.ts'
 import { getChart, listCharts, listDataSources } from './charts.ts'
-import { getRun, RunError, startChartRun, startDrillRun } from './runs.ts'
+import { getFilterOptions, getRun, RunError, startChartRun, startDrillRun } from './runs.ts'
 
 const idParam = z.object({ id: z.uuid() })
 
@@ -81,6 +81,14 @@ export function createApp(deps: GenerateDeps) {
     /** A chart's query and spec, as the AI last left them. */
     .get('/api/charts/:id', valid('param', idParam), async (c) => {
       return c.json({ chart: await getChart(deps, c.req.valid('param').id) })
+    })
+    /**
+     * What a viewer can pick from each lookup filter of the chart, by filter
+     * name, read from the warehouse (and remembered for a minute). Filters
+     * with written-out options carry them in the chart itself.
+     */
+    .get('/api/charts/:id/filter-options', valid('param', idParam), async (c) => {
+      return c.json({ options: await getFilterOptions(deps, c.req.valid('param').id) })
     })
     /** Starts a chat with the AI about a chart. */
     .post('/api/charts/:id/threads', valid('param', idParam), async (c) => {

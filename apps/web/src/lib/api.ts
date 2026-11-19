@@ -25,6 +25,9 @@ export type Chart = {
   updatedAt: string
 }
 
+/** What a viewer can pick from a filter. */
+export type FilterChoice = { key: string; label: string }
+
 export type Row = Record<string, unknown>
 
 export type Run = {
@@ -80,6 +83,9 @@ export const createThread = async (chartId: string) =>
   (await request<{ thread: { id: string } }>(`/api/charts/${chartId}/threads`, 'POST')).thread.id
 export const getMessages = async (threadId: string) =>
   (await request<{ messages: UIMessage[] }>(`/api/threads/${threadId}/messages`)).messages
+/** The options of the chart's lookup filters, by filter name, as the warehouse lists them now. */
+export const getFilterOptions = async (chartId: string) =>
+  (await request<{ options: Record<string, FilterChoice[]> }>(`/api/charts/${chartId}/filter-options`)).options
 /** Runs a chart. `filters` picks options by filter name; a filter left out applies its default. */
 export const startRun = async (chartId: string, filters?: FilterSelection) =>
   (await request<{ run: Run }>(`/api/charts/${chartId}/runs`, 'POST', filters && { filters })).run

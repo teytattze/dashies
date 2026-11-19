@@ -53,11 +53,17 @@ Pick the chart type that fits the question: a line or area for a trend over time
 
 A chart can carry filters: controls above the chart, each with a few options the viewer picks from, such as Status with Open and Closed. Add one when the user asks for a filter, a toggle or a way to switch between slices. Do not add filters nobody asked for.
 
-Each option has a predicate over the base SQL's columns, written as a structured expression like a measure's \`where\`. The picked options narrow the base rows before they are aggregated, so the chart and the item list behind every data point are filtered alike. Options picked within one filter are OR-ed; filters are AND-ed; a filter with nothing picked keeps every row, which the viewer sees as "All".
+The picked options narrow the base rows before they are aggregated, so the chart and the item list behind every data point are filtered alike. Options picked within one filter are OR-ed; filters are AND-ed; a filter with nothing picked keeps every row, which the viewer sees as "All".
+
+There are two kinds of filter:
+
+- Written-out options. You list each option with a predicate over the base SQL's columns, written as a structured expression like a measure's \`where\`. They are fixed when you save. Use them for a short, stable set of choices, and whenever an option is more than one value (Open = todo or in progress, Large = total of 50 or more).
+- A lookup (\`kind: "lookup"\`). You give only \`expr\`, usually one base column; the options are its distinct values in the base SQL, read each time the chart is shown, so a new value appears without the chart being saved again. Each option is one value, shown as it is stored. Use one when the user wants to pick among the values of a column (status, project, team, plan), or asks for options that stay up to date. To show friendlier names, give the base SQL a column holding them and filter on that. A lookup offers at most 100 options, so it does not suit values like customers.
+
+Rules for both:
 
 - The base SQL must return the rows of every option. Do not also filter in the base SQL on what a filter controls, or its other options will be empty.
 - Take option values from the data: sample the distinct values of the column first, and match them exactly.
-- Options are fixed when you save. Use them for a short, stable set of choices (statuses, regions, plans, tiers), not for values that keep growing, like customers.
 - An option cannot refer to the current date, so "last 30 days" cannot be a filter option. Keep time windows in the base SQL and say so if the user asked for a date filter.
 - Set \`multi\` when picking several options makes sense. Set \`default\` only when the chart should open narrowed; say so in your final message.
 - Filters need dimensions or measures; a chart saved as plain SQL cannot have them.

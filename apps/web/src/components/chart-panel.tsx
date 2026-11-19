@@ -1,15 +1,24 @@
-import { ChevronLeft, ChevronRight, LoaderCircle, RefreshCw, X } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { ChevronDown, ChevronLeft, ChevronRight, LoaderCircle, RefreshCw, X } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 import { ChartView, DataTable, PointLabel } from '@/components/chart-view'
 import { RunSql } from '@/components/run-sql'
 import { Button } from '@/components/ui/button'
 import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
   type Chart,
   type ChartFilter,
   type DrillRequest,
+  type FilterChoice,
   type FilterSelection,
   finished,
   getChart,
+  getFilterOptions,
   type Row,
   type Run,
   startDrillRun,
@@ -17,16 +26,42 @@ import {
 } from '@/lib/api'
 
 /**
+ * A filter as the viewer sees it: its options are written into the chart, or read from the warehouse.
+ * `error` is why a lookup filter's options could not be read; it then has none to pick from.
+ */
+type Control = { name: string; multi: boolean; options: FilterChoice[]; error?: string }
+
+/** The options of a chart's lookup filters, or why they could not be read. */
+type Lookups = { options: Record<string, FilterChoice[]> } | { error: string }
+
+const readLookups = (chartId: string): Promise<Lookups> =>
+  getFilterOptions(chartId).then(
+    (options) => ({ options }),
+    (e: unknown) => ({ error: e instanceof Error ? e.message : String(e) }),
+  )
+
+const controlsOf = (filters: ChartFilter[], lookups: Lookups): Control[] =>
+  filters.map((filter) => {
+    const control = { name: filter.name, multi: filter.multi ?? false }
+    if (filter.kind !== 'lookup') return { ...control, options: filter.options }
+    if ('error' in lookups) return { ...control, options: [], error: lookups.error }
+    return { ...control, options: lookups.options[filter.name] ?? [] }
+  })
+
+
+/**
  * The picked options the chart's filters still have (the AI may have changed
  * them since). A filter that was not picked from is left out, so its default applies.
  */
-function fitting(filters: ChartFilter[], picked: FilterSelection): FilterSelection {
+function fitting(controls: Control[], picked: FilterSelection): FilterSelection {
   return Object.fromEntries(
-    filters.flatMap((filter) => {
-      const keys = picked[filter.name]
+    controls.flatMap((control) => {
+      // Nothing can be picked from options that could not be read. Saying so keeps the run from needing them for a default.
+      if (control.error) return [[control.name, []]]
+      const keys = picked[control.name]
       if (!keys) return []
-      const kept = filter.options.map((o) => o.key).filter((key) => keys.includes(key))
-      return [[filter.name, filter.multi ? kept : kept.slice(0, 1)]]
+      const kept = control.options.map((o) => o.key).filter((key) => keys.includes(key))
+      return [[control.name, control.multi ? kept : kept.slice(0, 1)]]
     }),
   )
 }
@@ -37,7 +72,7 @@ function fitting(filters: ChartFilter[], picked: FilterSelection): FilterSelecti
  */
 export function ChartPanel({ chartId, version, building }: { chartId: string | null; version: number; building: boolean }) {
   // The chart and the run of that same definition, replaced together so rows are never drawn with another spec.
-  const [shown, setShown] = useState<{ chart: Chart; run: Run | null } | null>(null)
+  const [shown, setShown] = useState<{ chart: Chart; controls: Control[]; run: Run | null } | null>(null)
   // The request that last finished, and its error if it failed. Loading = the current request has not finished.
   const [settled, setSettled] = useState<{ request: string; error: string | null } | null>(null)
   const [refresh, setRefresh] = useState(0)
@@ -50,6 +85,9 @@ export function ChartPanel({ chartId, version, building }: { chartId: string | n
   const request = `${chartId}:${version}:${refresh}:${JSON.stringify(picked)}`
   const loading = chartId !== null && settled?.request !== request
   const error = settled?.request === request ? settled.error : null
+  // The lookup options are read once per definition and refresh, not again for every pick.
+  const lookupsKey = `${chartId}:${version}:${refresh}`
+  const lookupsRead = useRef<{ key: string; lookups: Promise<Lookups> } | null>(null)
 
   useEffect(() => {
     if (!chartId) return
@@ -60,9 +98,19 @@ export function ChartPanel({ chartId, version, building }: { chartId: string | n
     void (async () => {
       const chart = await getChart(chartId)
       if (cancelled) return
-      if (!chart.query) return setShown({ chart, run: null })
-      const run = await finished(await startRun(chartId, picked && fitting(chart.query.filters, picked)), () => cancelled)
-      if (!cancelled) setShown({ chart, run })
+      if (!chart.query) return setShown({ chart, controls: [], run: null })
+      const { filters } = chart.query
+      let lookups: Lookups = { options: {} }
+      // Only lookup filters have options to fetch.
+      if (filters.some((f) => f.kind === 'lookup')) {
+        if (lookupsRead.current?.key !== lookupsKey) lookupsRead.current = { key: lookupsKey, lookups: readLookups(chartId) }
+        lookups = await lookupsRead.current.lookups
+      }
+      const controls = controlsOf(filters, lookups)
+      if (cancelled) return
+      const sent = picked || controls.some((c) => c.error) ? fitting(controls, picked ?? {}) : undefined
+      const run = await finished(await startRun(chartId, sent), () => cancelled)
+      if (!cancelled) setShown({ chart, controls, run })
     })().then(
       () => settle(null),
       (e: unknown) => settle(e instanceof Error ? e.message : String(e)),
@@ -70,13 +118,13 @@ export function ChartPanel({ chartId, version, building }: { chartId: string | n
     return () => {
       cancelled = true
     }
-  }, [chartId, request, picked])
+  }, [chartId, request, picked, lookupsKey])
 
   const chart = shown?.chart
   const run = shown?.run
   const rows = run?.status === 'succeeded' ? run.rows : null
   const columns = run?.columns ?? chart?.query?.resultColumns ?? []
-  const filters = chart?.spec && chart.id === chartId ? (chart.query?.filters ?? []) : []
+  const filters = chart?.spec && chart.id === chartId ? (shown?.controls ?? []) : []
   // What the controls show: the viewer's picks at once, before the run they started has finished; else what the run applied.
   const selection = fitting(filters, picked ?? run?.filters ?? {})
   const pick = (name: string, keys: string[]) => chartId && setAsked({ chartId, filters: { ...selection, [name]: keys } })
@@ -151,40 +199,68 @@ export function ChartPanel({ chartId, version, building }: { chartId: string | n
   )
 }
 
-/** One row of options per filter. "All" is a filter with nothing picked. */
-function FilterBar(props: { filters: ChartFilter[]; selection: FilterSelection; onPick(name: string, keys: string[]): void }) {
+/** One control per filter. "All" is a filter with nothing picked. */
+function FilterBar(props: { filters: Control[]; selection: FilterSelection; onPick(name: string, keys: string[]): void }) {
   return (
     <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
       {props.filters.map((filter) => {
         const keys = props.selection[filter.name] ?? []
-        const toggle = (key: string) => {
-          if (keys.includes(key)) return keys.filter((k) => k !== key)
-          return filter.multi ? [...keys, key] : [key]
-        }
-        const chip = (label: string, pressed: boolean, next: string[]) => (
-          <Button key={label} size="xs" variant={pressed ? 'default' : 'outline'} aria-pressed={pressed} onClick={() => props.onPick(filter.name, next)}>
-            {label}
-          </Button>
-        )
+        const onPick = (next: string[]) => props.onPick(filter.name, next)
+        let control
+        if (filter.error) {
+          control = (
+            <span className="text-destructive text-xs" title={filter.error}>
+              Options unavailable
+            </span>
+          )
+        } else if (filter.options.length === 0) control = <span className="text-muted-foreground text-xs">No values</span>
+        else control = <FilterMenu filter={filter} keys={keys} onPick={onPick} />
         return (
           <div key={filter.name} role="group" aria-label={filter.name} className="flex flex-wrap items-center gap-1.5">
             <span className="text-muted-foreground mr-0.5 text-xs font-medium">{filter.name}</span>
-            {chip('All', keys.length === 0, [])}
-            {filter.options.map((option) => (
-              <Button
-                key={option.key}
-                size="xs"
-                variant={keys.includes(option.key) ? 'default' : 'outline'}
-                aria-pressed={keys.includes(option.key)}
-                onClick={() => props.onPick(filter.name, toggle(option.key))}
-              >
-                {option.label}
-              </Button>
-            ))}
+            {control}
           </div>
         )
       })}
     </div>
+  )
+}
+
+/** A filter's options in a dropdown menu, ticked when picked. */
+function FilterMenu({ filter, keys, onPick }: { filter: Control; keys: string[]; onPick(keys: string[]): void }) {
+  const picked = filter.options.filter((o) => keys.includes(o.key))
+  const summary = picked.length === 0 ? 'All' : picked.length <= 2 ? picked.map((o) => o.label).join(', ') : `${picked.length} selected`
+  // A menu closes when an item is chosen; one that takes several picks stays open for the next.
+  const chosen = (e: Event) => filter.multi && e.preventDefault()
+  const toggled = (key: string, checked: boolean) => {
+    if (!checked) return keys.filter((k) => k !== key)
+    return filter.multi ? [...keys, key] : [key]
+  }
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button size="xs" variant={picked.length ? 'default' : 'outline'} className="max-w-64" aria-label={`${filter.name}: ${summary}`}>
+          <span className="truncate">{summary}</span>
+          <ChevronDown />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent className="max-h-72 max-w-72">
+        <DropdownMenuCheckboxItem checked={keys.length === 0} onCheckedChange={() => onPick([])} onSelect={chosen}>
+          All
+        </DropdownMenuCheckboxItem>
+        <DropdownMenuSeparator />
+        {filter.options.map((option) => (
+          <DropdownMenuCheckboxItem
+            key={option.key}
+            checked={keys.includes(option.key)}
+            onCheckedChange={(checked) => onPick(toggled(option.key, checked))}
+            onSelect={chosen}
+          >
+            <span className="truncate">{option.label}</span>
+          </DropdownMenuCheckboxItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 

@@ -3,8 +3,9 @@ import { eq } from 'drizzle-orm'
 import * as z from 'zod'
 import { getChart } from '../charts.ts'
 import * as s from '../db/schema.ts'
-import type { ResultColumn } from '../db/types.ts'
-import { compileBase, compileChart, type QueryDefinition } from '../query/compile.ts'
+import type { Predicate, ResultColumn } from '../db/types.ts'
+import { readLookup } from '../lookups.ts'
+import { compileBase, compileChart, compileLookup, isLookup, LOOKUP_MAX_OPTIONS, type QueryDefinition } from '../query/compile.ts'
 import type { Dialect } from '../query/dialect.ts'
 import type { Database } from '../runs.ts'
 import { describeQuery, type Explorer } from '../snowflake/catalog.ts'
@@ -115,17 +116,36 @@ export async function checkQuery(
   const filterNames = q.filters.map((f) => f.name)
   const repeated = filterNames.find((name, i) => filterNames.indexOf(name) !== i)
   if (repeated) throw new Invalid(`Two filters are named "${repeated}"`)
+  /** Every predicate a viewer's picks can produce, described together below. */
+  const every: Predicate[] = []
   for (const filter of q.filters) {
-    const keys = filter.options.map((o) => o.key)
-    const twice = keys.find((key, i) => keys.indexOf(key) !== i)
-    if (twice) throw new Invalid(`Filter "${filter.name}" has two options with the key "${twice}"`)
+    const read = new Set<string>()
+    let keys: string[]
+    if (isLookup(filter)) {
+      scalarColumns(filter.expr, read)
+      const unknown = missing(read, baseColumns)
+      if (unknown.length > 0) throw new Invalid(`Unknown column in filter "${filter.name}": ${quote(unknown)}. ${available}`)
+      const { options, truncated } = await readLookup(explorer, compileLookup(q, filter, dialect))
+      if (truncated) {
+        throw new Invalid(
+          `Filter "${filter.name}" would offer more than ${LOOKUP_MAX_OPTIONS} options: its expression has that many distinct values in the base SQL`,
+        )
+      }
+      keys = options.map((o) => o.key)
+      // No base rows yet = no options yet; they appear with the data.
+      if (options.length > 0) every.push({ type: 'in', arg: filter.expr, values: options.map((o) => o.value) })
+    } else {
+      keys = filter.options.map((o) => o.key)
+      const twice = keys.find((key, i) => keys.indexOf(key) !== i)
+      if (twice) throw new Invalid(`Filter "${filter.name}" has two options with the key "${twice}"`)
+      for (const option of filter.options) predicateColumns(option.where, read)
+      every.push(...filter.options.map((o) => o.where))
+    }
     const absent = (filter.default ?? []).filter((key) => !keys.includes(key))
     if (absent.length > 0) throw new Invalid(`The default of filter "${filter.name}" names options it does not have: ${quote(absent)}`)
     if (!filter.multi && (filter.default ?? []).length > 1) {
       throw new Invalid(`Filter "${filter.name}" takes one option, so its default can name only one; set multi to allow several`)
     }
-    const read = new Set<string>()
-    for (const option of filter.options) predicateColumns(option.where, read)
     const unknown = missing(read, baseColumns)
     if (unknown.length > 0) throw new Invalid(`Unknown column in filter "${filter.name}": ${quote(unknown)}. ${available}`)
   }
@@ -134,7 +154,6 @@ export async function checkQuery(
   let filteredSql: string | null
   try {
     chartSql = compileChart(q, dialect)
-    const every = q.filters.flatMap((f) => f.options.map((o) => o.where))
     filteredSql = every.length > 0 ? compileBase(q, dialect, every) : null
   } catch (error) {
     throw new Invalid(error instanceof Error ? error.message : String(error))
@@ -217,7 +236,7 @@ export function chartTools({ db, dialect, explorer, chartId }: ToolContext) {
             .array(chartFilter)
             .max(6)
             .default([])
-            .describe('Controls the viewer narrows the chart with by picking from options you define. Omit if none are wanted.'),
+            .describe('Controls the viewer narrows the chart with by picking from options: ones you write out, or the distinct values of a base column. Omit if none are wanted.'),
           drill: drillSpec.nullish().describe('The item list a user sees after clicking a data point. Omit if the rows are not worth listing.'),
         }),
         spec: chartSpec.describe(

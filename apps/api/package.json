@@ -11,6 +11,7 @@
     "test": "bun test",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio",
     "seed:snowflake": "bun src/seed/snowflake.ts",
     "seed:datasource": "bun src/seed/datasource.ts"
   },

@@ -1,16 +1,21 @@
 import { and, eq } from 'drizzle-orm'
 import type { PgDatabase } from 'drizzle-orm/pg-core'
 import * as s from './db/schema.ts'
-import type { FilterSelection, ResultColumn } from './db/types.ts'
+import type { FilterSelection, LookupFilter, LookupOption, ResultColumn } from './db/types.ts'
 import {
   compileBase,
   compileChart,
   compileDrillPage,
   compileDrillSnapshot,
   DRILL_MAX_ROWS,
+  compileLookup,
   DRILL_ROW_NUMBER,
+  isLookup,
+  knownFilters,
+  lookupsNeeded,
   resolveFilters,
 } from './query/compile.ts'
+import { cachedLookup } from './lookups.ts'
 import type { Dialect } from './query/dialect.ts'
 import { type QueryResult, SnowflakeError } from './snowflake/client.ts'
 
@@ -29,6 +34,10 @@ import { type QueryResult, SnowflakeError } from './snowflake/client.ts'
  * A chart run applies the filter options picked for it to the base rows it
  * reads, before freezing them. A drill-down is never given filters of its own:
  * it reads its chart run's copy, which holds only the rows that run charted.
+ *
+ * The options of a lookup filter are the distinct values of its expression in
+ * the base rows, read from the warehouse (see `lookups.ts`). A run that picks from one reads them first, to check the
+ * picked keys and write their values into its SQL; that one read is waited for.
  */
 
 /** Most aggregated rows a chart receives. */
@@ -40,6 +49,8 @@ export type Warehouse = {
   submit(sql: string, params?: unknown[], options?: { forResultScan?: boolean }): Promise<string>
   /** The statement's result, or null while it is still running. Throws `SnowflakeError` if it failed. */
   poll(handle: string, options?: { maxRows?: number }): Promise<QueryResult | null>
+  /** Runs a statement and waits for its result. Only for small reads: the options of lookup filters. */
+  execute(sql: string, params?: unknown[], options?: { maxRows?: number }): Promise<QueryResult>
 }
 
 export type Database = PgDatabase<any, typeof s>
@@ -122,11 +133,35 @@ export type DrillRequest =
  */
 export async function startChartRun(deps: RunDeps, chartId: string, filters?: FilterSelection): Promise<RunView> {
   const { query, warehouse } = await load(deps, chartId)
-  const { selection, where } = invalidAs400(() => resolveFilters(query.filters, filters))
+  // Checked first, so a request that names no such filter reads nothing.
+  invalidAs400(() => knownFilters(query.filters, filters))
+  const lookups = await readLookups(deps, query, warehouse, lookupsNeeded(query.filters, filters))
+  const { selection, where } = invalidAs400(() => resolveFilters(query.filters, filters, lookups))
   const chart = invalidAs400(() => compileChart(query, deps.dialect, undefined, where))
   // Only a drillable query needs its base rows frozen.
   const sql = query.drill ? invalidAs400(() => compileBase(query, deps.dialect, where)) : chart
   return start(deps, query, warehouse, { kind: 'chart', sql, filters: selection }, sql, [], query.drill !== null)
+}
+
+/** What a viewer can pick from each lookup filter of a chart right now, by filter name. Filters with written-out options are not listed. */
+export async function getFilterOptions(deps: RunDeps, chartId: string): Promise<Record<string, { key: string; label: string }[]>> {
+  const { query, warehouse } = await load(deps, chartId)
+  const lookups = await readLookups(deps, query, warehouse, query.filters.filter(isLookup))
+  return Object.fromEntries(Object.entries(lookups).map(([name, options]) => [name, options.map(({ key, label }) => ({ key, label }))]))
+}
+
+async function readLookups(deps: RunDeps, query: Query, warehouse: Warehouse, filters: LookupFilter[]): Promise<Record<string, LookupOption[]>> {
+  const read = async (filter: LookupFilter) => {
+    const sql = invalidAs400(() => compileLookup(query, filter, deps.dialect))
+    try {
+      return [filter.name, await cachedLookup(query.dataSourceId, warehouse, sql)] as const
+    } catch (error) {
+      // 422 = the statement itself failed, e.g. a table of the base SQL is gone.
+      if (!(error instanceof SnowflakeError) || error.status !== 422) throw error
+      throw new RunError(409, `Filter "${filter.name}" could not read its options: ${error.message}`)
+    }
+  }
+  return Object.fromEntries(await Promise.all(filters.map(read)))
 }
 
 /** Starts running one page of the items behind a clicked data point. */
